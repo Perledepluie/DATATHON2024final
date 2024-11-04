@@ -1,122 +1,168 @@
 import streamlit as st
 import yfinance as yf
-import boto3
-import json
-import requests
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 from textblob import TextBlob
-
-# Configuration des clés d'API et AWS S3
-news_api_key = "ddd73f9423ad41c2aff5090e8493c142"
-s3 = boto3.client('s3', region_name='us-west-2')
+import boto3
+import json
+import datetime
 
 # Configuration de la page
 st.set_page_config(page_title="Tableau de Bord Financier Intelligent", layout="wide")
 
-# Fonction de chargement des données KPI
-@st.cache_data
-def get_kpi_data(symbol):
-    ticker = yf.Ticker(symbol)
-    kpi_data = ticker.history(period="5y")
-    kpi_data['NET_CHANGE'] = kpi_data['Close'].pct_change() * 100
-    kpi_data.index = kpi_data.index.tz_localize(None)  # Supprime les informations de fuseau horaire
-    return kpi_data
+# Configuration des services AWS
+s3 = boto3.client('s3', region_name='us-west-2')
+bedrock = boto3.client('bedrock-runtime', region_name='us-west-2')
 
-# Fonction pour obtenir les rapports financiers
-def get_financial_reports(symbol):
-    ticker = yf.Ticker(symbol)
-    return ticker.balance_sheet, ticker.financials, ticker.cashflow
+# Clé API NewsAPI
+YOUR_NEWS_API_KEY = "ddd73f9423ad41c2aff5090e8493c142"
 
-# Simulation de scénario
-def simulate_scenario(revenue_growth, cost_growth, margin):
-    revenue_projection = [100 * (1 + revenue_growth)**i for i in range(5)]
-    cost_projection = [80 * (1 + cost_growth)**i for i in range(5)]
-    profit_projection = [(r - c) * margin for r, c in zip(revenue_projection, cost_projection)]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=list(range(5)), y=revenue_projection, mode='lines+markers', name="Revenus"))
-    fig.add_trace(go.Scatter(x=list(range(5)), y=cost_projection, mode='lines+markers', name="Coûts"))
-    fig.add_trace(go.Scatter(x=list(range(5)), y=profit_projection, mode='lines+markers', name="Profit"))
-    fig.update_layout(title="Projection Financière", height=300, margin=dict(l=10, r=10, t=30, b=10))
-    return fig
-
-# Fonction pour obtenir les scores ESG
+# Fonction pour récupérer les scores ESG
 def get_esg_scores(symbol):
     ticker = yf.Ticker(symbol)
     esg_data = ticker.sustainability
     if esg_data is not None:
-        return {
-            'Environment': esg_data.loc['environmentScore'].values[0] if 'environmentScore' in esg_data.index else None,
-            'Social': esg_data.loc['socialScore'].values[0] if 'socialScore' in esg_data.index else None,
-            'Governance': esg_data.loc['governanceScore'].values[0] if 'governanceScore' in esg_data.index else None
+        esg_scores = {
+            'Environment': esg_data.loc['environmentScore'].values[0],
+            'Social': esg_data.loc['socialScore'].values[0],
+            'Governance': esg_data.loc['governanceScore'].values[0]
         }
-    return {'Environment': None, 'Social': None, 'Governance': None}
+    else:
+        esg_scores = {'Environment': None, 'Social': None, 'Governance': None}
+    return esg_scores
 
-# Analyse de sentiment
-def get_sentiment(query):
-    url = f"https://newsapi.org/v2/everything?q={query}&language=en&apiKey={news_api_key}"
+# Fonction de chargement des données KPI, avec moyenne annuelle
+@st.cache_data
+def get_kpi_data(symbol):
+    ticker = yf.Ticker(symbol)
+    kpi_data = ticker.history(period="5y")
+    kpi_data['Year'] = kpi_data.index.year
+    kpi_data = kpi_data.groupby('Year').mean()  # Moyenne annuelle
+    kpi_data['NET_CHANGE'] = kpi_data['Close'].pct_change() * 100
+    return kpi_data
+
+# Fonction pour afficher les KPI en barres par année
+def plot_kpi_barchart(kpi_data):
+    fig = go.Figure()
+    metrics = ['Close', 'Volume', 'Open', 'High']
+    for i, metric in enumerate(metrics):
+        fig.add_trace(go.Bar(
+            x=kpi_data.index,
+            y=kpi_data[metric],
+            name=metric,
+            marker_color=f"rgba({(i+1)*50}, {(i+1)*30}, 150, 0.6)"
+        ))
+    fig.update_layout(barmode='group', title="KPI Annuel", xaxis_title="Année", yaxis_title="Valeur")
+    st.plotly_chart(fig)
+
+# Fonction pour afficher les scores ESG
+def plot_esg_scores(esg_scores):
+    fig = go.Figure()
+    for category, score in esg_scores.items():
+        fig.add_trace(go.Indicator(
+            mode="gauge+number",
+            value=score if score is not None else 0,
+            title={'text': category},
+            gauge={'axis': {'range': [0, 100]}, 'bar': {'color': "green" if score and score > 50 else "red"}}
+        ))
+    fig.update_layout(title="Scores ESG")
+    st.plotly_chart(fig)
+
+# Fonction pour obtenir un résumé critique des rapports financiers via AWS Bedrock
+def get_financial_report_summary(symbol):
+    prompt = f"Analyser les rapports financiers de {symbol}. Inclure les points clés, les chiffres importants, et les 'non-dits'. Lire entre les lignes."
+    try:
+        response = bedrock.invoke_model(
+            modelId='amazon.titan-tg1-large',  # Remplacez par le modèle disponible
+            body=json.dumps({"inputText": prompt}),
+            contentType='application/json',
+        )
+        result = json.loads(response['body'].read())
+        report_summary = result.get('results', [{}])[0].get('generated_text', "Aucun résumé disponible")
+    except Exception as e:
+        st.error(f"Erreur lors de la génération du résumé : {e}")
+        report_summary = "Impossible de générer le résumé."
+    
+    return report_summary
+
+# Fonction pour analyser l'évolution du sentiment dans le temps
+def get_sentiment_trend(symbol):
+    url = f"https://newsapi.org/v2/everything?q={symbol}&language=en&apiKey={YOUR_NEWS_API_KEY}"
     response = requests.get(url)
+    if response.status_code != 200:
+        st.error("Erreur lors de la récupération des actualités.")
+        return pd.DataFrame(), 0
+    
     articles = response.json().get('articles', [])
-    sentiments = [TextBlob(article['description']).sentiment.polarity for article in articles if article['description']]
-    avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0
-    s3.put_object(
-        Bucket='tableau-de-bord-datathon',
-        Key=f'Sentiment/{query}_news_sentiment.json',
-        Body=json.dumps({'sentiment': avg_sentiment})
-    )
-    return avg_sentiment
+    sentiments = []
+    dates = []
+    
+    for article in articles:
+        if 'description' in article and article['description']:
+            polarity = TextBlob(article['description']).sentiment.polarity
+            sentiments.append(polarity)
+            dates.append(datetime.datetime.strptime(article['publishedAt'][:10], "%Y-%m-%d"))
+    
+    sentiment_df = pd.DataFrame({"Date": dates, "Sentiment": sentiments})
+    sentiment_df = sentiment_df.set_index('Date').resample('M').mean()  # Moyenne mensuelle
+    avg_sentiment = round(sentiment_df['Sentiment'].mean() * 100, 2) if not sentiment_df.empty else 0
+    return sentiment_df, avg_sentiment
 
-# Affichage principal
+# Affichage du graphique de tendance du sentiment
+def plot_sentiment_trend(sentiment_df, avg_sentiment):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=sentiment_df.index, y=sentiment_df['Sentiment'], mode='lines+markers', name="Sentiment"))
+    fig.update_layout(title="Évolution du Sentiment (moyenne mensuelle)", xaxis_title="Date", yaxis_title="Score de Sentiment")
+    st.plotly_chart(fig)
+    st.write(f"Sentiment moyen actuel : {avg_sentiment}%")
+
+# Fonction Chatbot pour analyse avancée avec Titan de Bedrock
+def chatbot_response(question):
+    try:
+        response = bedrock.invoke_model(
+            modelId='amazon.titan-tg1-large',  # Remplacez par le modèle disponible
+            body=json.dumps({"inputText": question}),
+            contentType='application/json',
+        )
+        result = json.loads(response['body'].read())
+        chatbot_reply = result.get('results', [{}])[0].get('generated_text', "Pas de réponse disponible")
+    except Exception as e:
+        st.error(f"Erreur lors de la génération de la réponse du chatbot : {e}")
+        chatbot_reply = "Impossible de générer la réponse."
+    
+    return chatbot_reply
+
+# Interface principale Streamlit
 st.title("Tableau de Bord Financier Intelligent")
 
-# Paramètres utilisateur dans la barre latérale
+# Input pour choisir l'entreprise
 symbol = st.sidebar.text_input("Entrez le symbole boursier :", value="AAPL").upper()
 
 if symbol:
+    # Affichage des KPI avec un graphique à barres annuelles
     kpi_data = get_kpi_data(symbol)
+    st.subheader("📊 Données KPI Annuel")
+    plot_kpi_barchart(kpi_data)
     
-    # Bloc KPI
-    latest_price = kpi_data['Close'].iloc[-1]
-    volume = kpi_data['Volume'].iloc[-1]
-    net_change = kpi_data['NET_CHANGE'].iloc[-1]
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Prix actuel", f"${latest_price:.2f}")
-    col2.metric("Volume", f"{volume:,.0f}")
-    col3.metric("Variation", f"{net_change:.2f}%")
-
-    # Affichage des rapports financiers
-    st.subheader("📊 Rapports Financiers")
-    balance_sheet, income_statement, cashflow = get_financial_reports(symbol)
-    col1, col2, col3 = st.columns(3)
-    col1.write("Bilan")
-    col1.dataframe(balance_sheet)
-    col2.write("Compte de Résultat")
-    col2.dataframe(income_statement)
-    col3.write("Flux de Trésorerie")
-    col3.dataframe(cashflow)
-
-    # Simulation de scénario
-    st.subheader("📈 Simulation de Scénario")
-    col1, col2, col3 = st.columns(3)
-    revenue_growth = col1.slider("Croissance des Revenus (%)", 0.01, 0.2, 0.05)
-    cost_growth = col2.slider("Croissance des Coûts (%)", 0.01, 0.2, 0.05)
-    margin = col3.slider("Marge Bénéficiaire", 0.1, 0.5, 0.2)
-    st.plotly_chart(simulate_scenario(revenue_growth, cost_growth, margin), use_container_width=True)
-
-    # Bloc Score ESG
-    st.subheader("🌍 Score ESG")
+    # Affichage des scores ESG
     esg_scores = get_esg_scores(symbol)
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Environnement", esg_scores.get('Environment', 'N/A'))
-    col2.metric("Social", esg_scores.get('Social', 'N/A'))
-    col3.metric("Gouvernance", esg_scores.get('Governance', 'N/A'))
-
-    # Sentiment des actualités
+    st.subheader("🌍 Score ESG")
+    plot_esg_scores(esg_scores)
+    
+    # Résumé critique des rapports financiers via Bedrock
+    st.subheader("📄 Résumé Critique des Rapports Financiers")
+    report_summary = get_financial_report_summary(symbol)
+    st.write(report_summary)
+    
+    # Graphique de l'évolution du sentiment des actualités
     st.subheader("📰 Sentiment des Actualités")
-    sentiment = round(get_sentiment(symbol)*100)
-    st.metric("Sentiment moyen", f"{sentiment}%")
-
-    # Affichage de la DataFrame filtrée
-    st.write("**Données Filtrées :**")
-    st.dataframe(kpi_data)
+    sentiment_df, avg_sentiment = get_sentiment_trend(symbol)
+    plot_sentiment_trend(sentiment_df, avg_sentiment)
+    
+    # Chatbot pour analyse avancée avec Titan de Bedrock
+    st.subheader("💬 Chatbot d'Assistance")
+    question = st.text_input("Posez une question à l'IA :")
+    if question:
+        response = chatbot_response(question)
+        st.write(response)
